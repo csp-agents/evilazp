@@ -1,0 +1,567 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
+using Agent.Sdk.Knob;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
+using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.TeamFoundation.Framework.Common;
+
+namespace Microsoft.VisualStudio.Services.Agent.Tests
+{
+    public sealed class ProcessInvokerL0
+    {
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task SuccessExitsWithCodeZero()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                Tracing trace = hc.GetTrace();
+
+                Int32 exitCode = -1;
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.Initialize(hc);
+                    exitCode = (TestUtil.IsWindows())
+                        ? await processInvoker.ExecuteAsync("", "cmd.exe", "/c \"dir >nul\"", null, CancellationToken.None)
+                        : await processInvoker.ExecuteAsync("", "bash", "-c echo .", null, CancellationToken.None);
+
+                    trace.Info($"Exit Code: {exitCode}");
+                    Assert.Equal(0, exitCode);
+                }
+            }
+        }
+
+        //Run a process that normally takes 20sec to finish and cancel it.
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
+        public async Task TestCancel()
+        {
+            const int SecondsToRun = 20;
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                Tracing trace = hc.GetTrace();
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.Initialize(hc);
+                    Stopwatch watch = Stopwatch.StartNew();
+                    Task execTask;
+                    if (TestUtil.IsWindows())
+                    {
+                        execTask = processInvoker.ExecuteAsync("", "cmd", $"/c waitfor /t {SecondsToRun} pause", null, tokenSource.Token);
+                    }
+                    else
+                    {
+                        execTask = processInvoker.ExecuteAsync("", "bash", $"-c \"sleep {SecondsToRun}s\"", null, tokenSource.Token);
+                    }
+
+                    await Task.Delay(500);
+                    tokenSource.Cancel();
+                    try
+                    {
+                        await execTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        trace.Info("Get expected OperationCanceledException.");
+                    }
+
+                    Assert.True(execTask.IsCompleted);
+                    Assert.True(!execTask.IsFaulted);
+                    Assert.True(execTask.IsCanceled);
+                    watch.Stop();
+                    long elapsedSeconds = watch.ElapsedMilliseconds / 1000;
+
+                    // if cancellation fails, then execution time is more than 15 seconds
+                    long expectedSeconds = (SecondsToRun * 3) / 4;
+
+                    Assert.True(elapsedSeconds <= expectedSeconds, $"cancellation failed, because task took too long to run. {elapsedSeconds}");
+                }
+            }
+        }
+
+        class ProcessInvokerWithOutKillingCancelledTask : ProcessInvoker
+        {
+            public ProcessInvokerWithOutKillingCancelledTask(ITraceWriter trace, bool disableWorkerCommands = false) : base(trace, disableWorkerCommands)
+            {
+            }
+
+            // override CancelAndKillProcessTree to avoid killing the cancelled task,
+            // so we can test that execution continues 
+            protected internal override Task CancelAndKillProcessTree(bool killProcessOnCancel)
+            {
+                return Task.CompletedTask;
+            }
+        }
+
+        //Run a process that normally takes 20sec to finish and cancel it.
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
+        public async Task TestCancelEnsureCompletedWhenTaskNotKilled()
+        {
+            const int SecondsToRun = 20;
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                Tracing trace = hc.GetTrace();
+                using (var processInvoker = new ProcessInvokerWithOutKillingCancelledTask(trace, false))
+                {
+                    Stopwatch watch = Stopwatch.StartNew();
+                    Task execTask;
+
+                    const bool continueAfterCancelProcessTreeKillAttempt = true;
+                    if (TestUtil.IsWindows())
+                    {
+                        execTask = processInvoker.ExecuteAsync("", "cmd", $"/c \"ping 127.0.0.1 -n {SecondsToRun} > nul\"", null, false, null, false, null, false, false, false, continueAfterCancelProcessTreeKillAttempt, tokenSource.Token);
+                    }
+                    else
+                    {
+                        execTask = processInvoker.ExecuteAsync("", "bash", $"-c \"sleep {SecondsToRun}s\"", null, false, null, false, null, false, false, false, continueAfterCancelProcessTreeKillAttempt, tokenSource.Token);
+                    }
+
+                    await Task.Delay(500);
+                    tokenSource.Cancel();
+                    try
+                    {
+                        await execTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        trace.Info("Get expected OperationCanceledException.");
+                    }
+
+                    Assert.True(execTask.IsCompleted);
+                    Assert.True(!execTask.IsFaulted);
+                    Assert.True(execTask.IsCanceled);
+                    watch.Stop();
+                    long elapsedSeconds = watch.ElapsedMilliseconds / 1000;
+
+                    // if cancellation fails, then execution time is more than 15 seconds
+                    long expectedSeconds = (SecondsToRun * 3) / 4;
+
+                    Assert.True(elapsedSeconds <= expectedSeconds, $"cancellation failed, because task took too long to run. {elapsedSeconds}");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task RedirectSTDINCloseStream()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var redirectSTDIN = new InputQueue<string>())
+            {
+                Tracing trace = hc.GetTrace();
+                Int32 exitCode = -1;
+                List<string> stdout = new List<string>();
+                redirectSTDIN.Enqueue("Single line of STDIN");
+
+                using (var cancellationTokenSource = new CancellationTokenSource())
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                    {
+                        stdout.Add(e.Data);
+                    };
+
+                    processInvoker.Initialize(hc);
+                    var proc = (TestUtil.IsWindows())
+                        ? processInvoker.ExecuteAsync("", "cmd.exe", "/c more", null, false, null, false, redirectSTDIN, false, false, cancellationTokenSource.Token)
+                        : processInvoker.ExecuteAsync("", "bash", "-c \"read input; echo $input; read input; echo $input; read input; echo $input;\"", null, false, null, false, redirectSTDIN, false, false, cancellationTokenSource.Token);
+
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    await Task.Delay(100);
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    await Task.Delay(100);
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    cancellationTokenSource.CancelAfter(100);
+
+                    try
+                    {
+                        exitCode = await proc;
+                        trace.Info($"Exit Code: {exitCode}");
+                    }
+                    catch (Exception ex)
+                    {
+                        trace.Error(ex);
+                    }
+
+                    trace.Info($"STDOUT: {string.Join(Environment.NewLine, stdout)}");
+                    Assert.False(stdout.Contains("More line of STDIN"), "STDIN should be closed after first input line.");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task RedirectSTDINKeepStreamOpen()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var redirectSTDIN = new InputQueue<string>())
+            {
+                Tracing trace = hc.GetTrace();
+                Int32 exitCode = -1;
+                List<string> stdout = new List<string>();
+                redirectSTDIN.Enqueue("Single line of STDIN");
+                using (var cancellationTokenSource = new CancellationTokenSource())
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                    {
+                        stdout.Add(e.Data);
+                    };
+
+                    processInvoker.Initialize(hc);
+                    var proc = (TestUtil.IsWindows())
+                        ? processInvoker.ExecuteAsync("", "cmd.exe", "/c more", null, false, null, false, redirectSTDIN, false, true, ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault, cancellationTokenSource.Token)
+                        : processInvoker.ExecuteAsync("", "bash", "-c \"read input; echo $input; read input; echo $input; read input; echo $input;\"", null, false, null, false, redirectSTDIN, false, true, ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault, cancellationTokenSource.Token);
+
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    await Task.Delay(100);
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    await Task.Delay(100);
+                    redirectSTDIN.Enqueue("More line of STDIN");
+                    cancellationTokenSource.CancelAfter(100);
+
+                    try
+                    {
+                        exitCode = await proc;
+                        trace.Info($"Exit Code: {exitCode}");
+                    }
+                    catch (Exception ex)
+                    {
+                        trace.Error(ex);
+                    }
+
+                    trace.Info(StringUtil.Format("STDOUT: {0}", string.Join(Environment.NewLine, stdout)));
+                    Assert.True(stdout.Contains("More line of STDIN"), "STDIN should keep open and accept more inputs after first input line.");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
+        [Trait("SkipOn", "windows")]
+        public async Task OomScoreAdjIsWriten_Default()
+        {
+            // We are on a system that supports oom_score_adj in procfs as assumed by ProcessInvoker
+            string testProcPath = $"/proc/{Process.GetCurrentProcess().Id}/oom_score_adj";
+            if (File.Exists(testProcPath))
+            {
+                using (TestHostContext hc = new TestHostContext(this))
+                using (var tokenSource = new CancellationTokenSource())
+                {
+                    Tracing trace = hc.GetTrace();
+                    using (var processInvoker = new ProcessInvokerWrapper())
+                    {
+                        processInvoker.Initialize(hc);
+                        int oomScoreAdj = -9999;
+                        processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                        {
+                            oomScoreAdj = int.Parse(e.Data);
+                            tokenSource.Cancel();
+                        };
+                        try
+                        {
+                            var proc = await processInvoker.ExecuteAsync("", "bash", "-c \"cat /proc/$$/oom_score_adj\"", null, false, null, false, null, false, false,
+                                                                highPriorityProcess: false,
+                                                                continueAfterCancelProcessTreeKillAttempt: ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault,
+                                                                cancellationToken: tokenSource.Token);
+                            Assert.Equal(oomScoreAdj, 500);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            trace.Info("Caught expected OperationCanceledException");
+                        }
+                    }
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
+        [Trait("SkipOn", "windows")]
+        public async Task OomScoreAdjIsWriten_FromEnv()
+        {
+            // We are on a system that supports oom_score_adj in procfs as assumed by ProcessInvoker
+            string testProcPath = $"/proc/{Process.GetCurrentProcess().Id}/oom_score_adj";
+            if (File.Exists(testProcPath))
+            {
+                using (TestHostContext hc = new TestHostContext(this))
+                using (var tokenSource = new CancellationTokenSource())
+                {
+                    Tracing trace = hc.GetTrace();
+                    using (var processInvoker = new ProcessInvokerWrapper())
+                    {
+                        processInvoker.Initialize(hc);
+                        int oomScoreAdj = -9999;
+                        processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                        {
+                            oomScoreAdj = int.Parse(e.Data);
+                            tokenSource.Cancel();
+                        };
+                        try
+                        {
+                            var proc = await processInvoker.ExecuteAsync("", "bash", "-c \"cat /proc/$$/oom_score_adj\"",
+                                                                    new Dictionary<string, string> { { "PIPELINE_JOB_OOMSCOREADJ", "1234" } },
+                                                                    false, null, false, null, false, false,
+                                                                    highPriorityProcess: false,
+                                                                    continueAfterCancelProcessTreeKillAttempt: ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault,
+                                                                    cancellationToken: tokenSource.Token);
+                            Assert.Equal(oomScoreAdj, 1234);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            trace.Info("Caught expected OperationCanceledException");
+                        }
+                    }
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
+        [Trait("SkipOn", "windows")]
+        public async Task OomScoreAdjIsInherited()
+        {
+            // We are on a system that supports oom_score_adj in procfs as assumed by ProcessInvoker
+            string testProcPath = $"/proc/{Process.GetCurrentProcess().Id}/oom_score_adj";
+            if (File.Exists(testProcPath))
+            {
+                int testProcOomScoreAdj = 123;
+                File.WriteAllText(testProcPath, testProcOomScoreAdj.ToString());
+                using (TestHostContext hc = new TestHostContext(this))
+                using (var tokenSource = new CancellationTokenSource())
+                {
+                    Tracing trace = hc.GetTrace();
+                    using (var processInvoker = new ProcessInvokerWrapper())
+                    {
+                        processInvoker.Initialize(hc);
+                        int oomScoreAdj = -9999;
+                        processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                        {
+                            oomScoreAdj = int.Parse(e.Data);
+                            tokenSource.Cancel();
+                        };
+                        try
+                        {
+                            var proc = await processInvoker.ExecuteAsync("", "bash", "-c \"cat /proc/$$/oom_score_adj\"", null, false, null, false, null, false, false,
+                                                                highPriorityProcess: true,
+                                                                continueAfterCancelProcessTreeKillAttempt: ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault,
+                                                                cancellationToken: tokenSource.Token);
+                            Assert.Equal(oomScoreAdj, 123);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            trace.Info("Caught expected OperationCanceledException");
+                        }
+                    }
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task DisableWorkerCommands()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                Tracing trace = hc.GetTrace();
+
+                Int32 exitCode = -1;
+                List<string> stdout = new List<string>();
+
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                    {
+                        stdout.Add(e.Data);
+                    };
+                    processInvoker.DisableWorkerCommands = true;
+                    processInvoker.Initialize(hc);
+                    exitCode = (TestUtil.IsWindows())
+                        ? await processInvoker.ExecuteAsync("", "powershell.exe", $@"-NoLogo -Sta -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -Command ""Write-Host '##vso somecommand'""", null, CancellationToken.None)
+                        : await processInvoker.ExecuteAsync("", "bash", "-c \"echo '##vso somecommand'\"", null, CancellationToken.None);
+
+                    trace.Info($"Exit Code: {exitCode}");
+                    Assert.Equal(0, exitCode);
+
+                    Assert.False(stdout.Contains("##vso somecommand"), $"##vso commands should be escaped.");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task EnableWorkerCommandsByDefault()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                Tracing trace = hc.GetTrace();
+
+                Int32 exitCode = -1;
+                List<string> stdout = new List<string>();
+
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs e) =>
+                    {
+                        stdout.Add(e.Data);
+                    };
+                    processInvoker.Initialize(hc);
+                    exitCode = (TestUtil.IsWindows())
+                        ? await processInvoker.ExecuteAsync("", "powershell.exe", $@"-NoLogo -Sta -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -Command ""Write-Host '##vso somecommand'""", null, CancellationToken.None)
+                        : await processInvoker.ExecuteAsync("", "bash", "-c \"echo '##vso somecommand'\"", null, CancellationToken.None);
+
+                    trace.Info($"Exit Code: {exitCode}");
+                    Assert.Equal(0, exitCode);
+
+                    Assert.True(stdout.Contains("##vso somecommand"), "##vso commands should not be escaped.");
+                }
+            }
+        }
+
+        // Race condition tests for ICM 698323303: Process exits during cancellation
+        // Validates that the try/catch in the cancellation callback (line 335-343) 
+        // properly handles InvalidOperationException when _proc is disposed during cancel.
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task TestCancel_ProcessExitsBeforeCancellation_NoException()
+        {
+            // Start a process that exits instantly, then cancel after a small delay.
+            // Validates: no InvalidOperationException when cancel fires on an already-exited process.
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                Tracing trace = hc.GetTrace();
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.Initialize(hc);
+
+                    // Start a process that exits immediately
+                    var execTask = (TestUtil.IsWindows())
+                        ? processInvoker.ExecuteAsync("", "cmd.exe", "/c exit 0", null, false, null, false, null, false, false, false, false, tokenSource.Token)
+                        : processInvoker.ExecuteAsync("", "bash", "-c \"exit 0\"", null, false, null, false, null, false, false, false, false, tokenSource.Token);
+
+                    // Small delay to let process exit, then cancel
+                    await Task.Delay(500);
+                    tokenSource.Cancel();
+
+                    // Should complete without throwing
+                    int exitCode = await execTask;
+                    trace.Info($"Exit Code: {exitCode}");
+                    Assert.Equal(0, exitCode);
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task TestCancel_ProcessAlreadyExited_NoException()
+        {
+            // Start a process that exits instantly, wait for completion, then fire cancellation.
+            // Validates that the cancellation callback handles an already-exited process gracefully.
+            using (TestHostContext hc = new TestHostContext(this))
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                Tracing trace = hc.GetTrace();
+                using (var processInvoker = new ProcessInvokerWrapper())
+                {
+                    processInvoker.Initialize(hc);
+
+                    // Start a process that exits immediately with a cancellation token
+                    var execTask = (TestUtil.IsWindows())
+                        ? processInvoker.ExecuteAsync("", "cmd.exe", "/c exit 0", null, false, null, false, null, false, false, false, false, tokenSource.Token)
+                        : processInvoker.ExecuteAsync("", "bash", "-c \"exit 0\"", null, false, null, false, null, false, false, false, false, tokenSource.Token);
+
+                    // Wait for the process to complete
+                    int exitCode = await execTask;
+                    trace.Info($"Exit Code: {exitCode}");
+                    Assert.Equal(0, exitCode);
+
+                    // Now cancel — the callback will attempt CancelAndKillProcessTree on an exited process.
+                    // This should not throw any unhandled exceptions.
+                    tokenSource.Cancel();
+
+                    // If we get here without crashing, the test passes
+                    trace.Info("Cancellation after process exit completed without exception.");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task TestCancel_ConcurrentExitAndCancel_NoException()
+        {
+            // Stress test: start a very short-lived process and cancel immediately.
+            // Run multiple iterations to maximize the chance of hitting the race window.
+            // Validates: no unhandled exception regardless of timing.
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                Tracing trace = hc.GetTrace();
+
+                for (int i = 0; i < 10; i++)
+                {
+                    using (var tokenSource = new CancellationTokenSource())
+                    using (var processInvoker = new ProcessInvokerWrapper())
+                    {
+                        processInvoker.Initialize(hc);
+
+                        // Start a process that exits very quickly
+                        var execTask = (TestUtil.IsWindows())
+                            ? processInvoker.ExecuteAsync("", "cmd.exe", "/c ping 127.0.0.1 -n 1 > nul", null, false, null, false, null, false, false, false, false, tokenSource.Token)
+                            : processInvoker.ExecuteAsync("", "bash", "-c \"sleep 0.05\"", null, false, null, false, null, false, false, false, false, tokenSource.Token);
+
+                        // Cancel almost immediately to race with process exit
+                        await Task.Delay(30);
+                        tokenSource.Cancel();
+
+                        // Should complete without crashing — either process exits first or cancel succeeds
+                        try
+                        {
+                            int exitCode = await execTask;
+                            trace.Info($"Iteration {i}: Exit Code: {exitCode}");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Expected if cancellation wins the race
+                            trace.Info($"Iteration {i}: OperationCanceledException (expected)");
+                        }
+                        // Any other exception (InvalidOperationException, NullReferenceException) would fail the test
+                    }
+                }
+            }
+        }
+    }
+}

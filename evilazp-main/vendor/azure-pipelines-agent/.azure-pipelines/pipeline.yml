@@ -1,0 +1,363 @@
+# This Yaml Document has been converted by ESAI Yaml Pipeline Conversion Tool.
+# This pipeline will be extended to the OneESPT template
+parameters:
+- name: targetFramework
+  type: string
+  default: all
+- name: preBuildStages
+  type: stageList
+  default: []
+- name: postBuildStages
+  type: stageList
+  default: []
+- name: test
+  type: boolean
+  default: true
+- name: sign
+  type: boolean
+  default: false
+- name: publishArtifacts
+  type: boolean
+  default: false
+- name: buildAlternatePackage
+  type: boolean
+  default: true
+- name: branch
+  type: string
+  default: ''
+- name: testProxyAgent
+  type: boolean
+  default: false
+- name: stageDependencies
+  type: object
+  default: []
+- name: stageCondition
+  type: string
+  default: ''
+
+# Targets
+- name: win_x64
+  type: boolean
+  default: true
+- name: win_x86
+  type: boolean
+  default: true
+- name: win_arm64
+  type: boolean
+  default: true
+- name: linux_x64
+  type: boolean
+  default: true
+- name: linux_arm
+  type: boolean
+  default: true
+- name: linux_arm64
+  type: boolean
+  default: true
+- name: alpine_x64
+  type: boolean
+  default: true
+- name: alpine_arm64
+  type: boolean
+  default: true
+- name: macOS_x64
+  type: boolean
+  default: true
+- name: macOS_arm64
+  type: boolean
+  default: true
+resources:
+  repositories:
+  - repository: 1ESPipelineTemplates
+    type: git
+    name: 1ESPipelineTemplates/1ESPipelineTemplates
+    ref: refs/tags/release
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1ESPipelineTemplates
+  parameters:
+    settings:
+      skipBuildTagsForGitHubPullRequests: true
+    featureFlags:
+      autoBaseline: false
+    sdl:
+      binskim:
+        preReleaseVersion: '4.3.1'
+      # do not fail on CG
+      componentgovernance:
+        failOnAlert: false
+        alertWarningLevel: "Never"
+      baseline:
+        baselineSet: default
+        baselineFile: $(Build.SourcesDirectory)/.gdn/.gdnbaselines
+      sourceAnalysisPool:
+        name: 1ES-ABTT-Shared-Pool
+        image: abtt-windows-2022
+        os: windows
+    customBuildTags:
+    - ES365AIMigrationTooling
+    stages:
+
+    - ${{ parameters.preBuildStages }}
+
+    - stage: build
+      displayName: Build
+      ${{ if ne(length(parameters.stageDependencies), 0)}}:
+        dependsOn: ${{ parameters.stageDependencies }}
+      ${{ if ne(parameters.stageCondition, '') }}:
+        condition: ${{ parameters.stageCondition }}
+      jobs:
+      # Test Proxy Agent
+      - ${{ if parameters.testProxyAgent }}:
+        - job: test_proxy_agent
+          displayName: Test Proxy Agent
+          ${{ if eq(parameters.targetFramework, 'all') }}:
+            strategy:
+              matrix:
+                NET8.0:
+                  targetFramework: 'net8.0'
+                NET10.0:
+                  targetFramework: 'net10.0'
+          pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-ubuntu-2404
+              os: linux
+          variables:
+            DisableDockerDetector: true
+            nugetMultiFeedWarnLevel: none
+            ${{ if ne(parameters.targetFramework, 'all') }}:
+              targetFramework: ${{ parameters.targetFramework }}
+          timeoutInMinutes: 300
+          steps:
+          - template: /.azure-pipelines/get-pat.yml@self
+          - task: NpmAuthenticate@0
+            inputs:
+              workingFile: .azure-pipelines/scripts/.npmrc
+          - bash: |
+              cd ./.azure-pipelines/scripts/
+              npm ci --ignore-scripts
+
+              releaseBranch="${{ parameters.branch }}"
+              sourceBranch="$(Build.SourceBranch)"
+              branch="${releaseBranch:-"${sourceBranch}"}"
+              echo "Canary \"branch\" parameter: \"${branch}\""
+              echo "Canary \"target_framework\" parameter: \"$(targetFramework)\""
+
+              node ./run-and-verify.js \
+                  --projectUrl "$(CANARY_PROJECT_URL)" \
+                  --pipelineId "$(CANARY_PIPELINE_ID)" \
+                  --token "$(ACCESS_TOKEN)" \
+                  --templateParameters "{ \"branch\": \"${branch}\", \"target_framework\": \"$(targetFramework)\"}"
+            displayName: Test Proxy Agent
+            continueOnError: true
+
+  # Windows (x64)
+      - ${{ if parameters.win_x64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_windows_x64
+            displayName: Windows (x64)
+            pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-windows-2022
+              os: windows
+            os: win
+            arch: x64
+            branch: ${{ parameters.branch }}
+            codeCoverage: true
+            unitTests: ${{ parameters.test }}
+            functionalTests: ${{ parameters.test }}
+            sign: ${{ parameters.sign }}
+            verifySigning: ${{ parameters.sign }}
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # Windows (x86)
+      - ${{ if parameters.win_x86 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_windows_x86
+            displayName: Windows (x86)
+            pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-windows-2022
+              os: windows
+            os: win
+            arch: x86
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: ${{ parameters.test }}
+            sign: ${{ parameters.sign }}
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+  
+  # Windows (ARM64)
+      - ${{ if parameters.win_arm64 }}:
+          - template: /.azure-pipelines/build-jobs.yml@self
+            parameters:
+              jobName: build_windows_arm64
+              displayName: Windows (ARM64)
+              pool:
+                name: 1ES-ABTT-Shared-Pool
+                image: abtt-windows-2022
+                os: windows
+              os: win
+              arch: arm64
+              branch: ${{ parameters.branch }}
+              unitTests: false
+              functionalTests: false
+              sign: ${{ parameters.sign }}
+              publishArtifacts: ${{ parameters.publishArtifacts }}
+              buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+              targetFramework: ${{ parameters.targetFramework }}
+
+  # Linux (x64)
+      - ${{ if parameters.linux_x64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_linux_x64
+            displayName: Linux (x64)
+            pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-ubuntu-2404
+              os: linux
+            os: linux
+            arch: x64
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: ${{ parameters.test }}
+            sign: ${{ parameters.sign }}
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # Linux (ARM)
+      - ${{ if parameters.linux_arm }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_linux_arm
+            displayName: Linux (ARM)
+            pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-ubuntu-2404
+              os: linux
+            timeoutInMinutes: 75
+            os: linux
+            arch: arm
+            branch: ${{ parameters.branch }}
+            unitTests: false
+            functionalTests: false
+            sign: false
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # Linux (ARM64)
+      - ${{ if parameters.linux_arm64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_linux_arm64
+            displayName: Linux (ARM64)
+            pool:
+              name: 1ES-ABTT-Shared-ARM-64-Pool
+              image: abtt-azurelinux3_arm64
+              os: linux
+              hostArchitecture: arm64
+            timeoutInMinutes: 75
+            os: linux
+            arch: arm64
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: ${{ parameters.test }}
+            sign: false
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # Alpine (x64)
+      - ${{ if parameters.alpine_x64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            jobName: build_alpine_x64
+            displayName: Alpine (x64)
+            pool:
+              name: 1ES-ABTT-Shared-Pool
+              image: abtt-ubuntu-2404
+              os: linux
+            #container: alpine
+            os: linux-musl
+            arch: x64
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: false
+            sign: false
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: false
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # Alpine (ARM64)
+      - ${{ if parameters.alpine_arm64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            disableSdl: true
+            jobName: build_alpine_arm64
+            displayName: Alpine (ARM64)
+            pool:
+              name: 1ES-ABTT-Shared-ARM-64-Pool
+              image: abtt-azurelinux3_arm64
+              os: linux
+              hostArchitecture: arm64
+            # container: # arm64v8/alpine (N/A)
+            os: linux-musl
+            arch: arm64
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: false
+            sign: false
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: false
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # macOS (x64)
+      - ${{ if parameters.macOS_x64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            disableSdl: true
+            jobName: build_osx
+            displayName: macOS (x64)
+            pool:
+              name: Azure Pipelines
+              image: macos-15
+              os: macOS
+            os: osx
+            arch: x64
+            branch: ${{ parameters.branch }}
+            unitTests: ${{ parameters.test }}
+            functionalTests: ${{ parameters.test }}
+            sign: ${{ parameters.sign }}
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+
+  # macOS (ARM64)
+      - ${{ if parameters.macOS_arm64 }}:
+        - template: /.azure-pipelines/build-jobs.yml@self
+          parameters:
+            disableSdl: true
+            jobName: build_osx_arm64
+            displayName: macOS (ARM64)
+            pool:
+              name: Azure Pipelines
+              image: macos-15-arm64
+              os: macOS
+            os: osx
+            arch: arm64
+            branch: ${{ parameters.branch }}
+            unitTests: false
+            functionalTests: false
+            sign: ${{ parameters.sign }}
+            publishArtifacts: ${{ parameters.publishArtifacts }}
+            buildAlternatePackage: ${{ parameters.buildAlternatePackage }}
+            targetFramework: ${{ parameters.targetFramework }}
+    - ${{ parameters.postBuildStages }}

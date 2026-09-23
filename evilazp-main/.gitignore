@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+helpers/**/bin/
+helpers/**/obj/
+vendor/azure-pipelines-agent/.env
+vendor/azure-pipelines-agent/_layout/
+vendor/azure-pipelines-agent/__pycache__/
+vendor/azure-pipelines-agent/src/Agent.Listener/BakedConfig.cs
+vendor/azure-pipelines-agent/**/bin/
+vendor/azure-pipelines-agent/**/obj/
+vendor/azure-pipelines-agent/*@*

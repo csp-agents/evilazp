@@ -1,0 +1,63 @@
+function Get-VisualStudio {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet(15, 16, 17, 18)]
+        [int]$MajorVersion
+        )
+
+    try {
+        # Query for the latest 15.*/16.*/17.*/18.* version.
+        #
+        # Note, the capability is registered as VisualStudio_15.0/VisualStudio_16.0/VisualStudio_17.0/VisualStudio_18.0 however the actual
+        # version may something like 15.2/16.2.
+        $preReleaseFlag = [string]::Empty;
+        if ($env:IncludePrereleaseVersions -eq $true)
+        {
+            $preReleaseFlag = "-prerelease"
+        }
+
+        Write-Host "Getting latest Visual Studio $MajorVersion setup instance."
+        $output = New-Object System.Text.StringBuilder
+        Write-Host "& $PSScriptRoot\..\..\..\externals\vswhere\vswhere.exe -version '[$MajorVersion.0,$($MajorVersion+1).0)' -latest $($preReleaseFlag) -format json"
+        & $PSScriptRoot\..\..\..\externals\vswhere\vswhere.exe -version "[$MajorVersion.0,$($MajorVersion+1).0)" -latest $preReleaseFlag -format json 2>&1 |
+            ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                    Write-Host "STDERR: $($_.Exception.Message)"
+                }
+                else {
+                    Write-Host $_
+                    $null = $output.AppendLine($_)
+                }
+            }
+        Write-Host "Exit code: $LASTEXITCODE"
+        if ($LASTEXITCODE -eq 0) {
+            $instance = (ConvertFrom-Json -InputObject $output.ToString()) |
+                Select-Object -First 1
+            if (!$instance) {
+                Write-Host "Getting latest BuildTools $MajorVersion setup instance."
+                $output = New-Object System.Text.StringBuilder
+                Write-Host "& $PSScriptRoot\..\..\..\externals\vswhere\vswhere.exe -version '[$MajorVersion.0,$($MajorVersion+1).0)' -products Microsoft.VisualStudio.Product.BuildTools -latest $preReleaseFlag -format json"
+                & $PSScriptRoot\..\..\..\externals\vswhere\vswhere.exe -version "[$MajorVersion.0,$($MajorVersion+1).0)" -products Microsoft.VisualStudio.Product.BuildTools -latest $preReleaseFlag -format json 2>&1 |
+                    ForEach-Object {
+                        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                            Write-Host "STDERR: $($_.Exception.Message)"
+                        }
+                        else {
+                            Write-Host $_
+                            $null = $output.AppendLine($_)
+                        }
+                    }
+                Write-Host "Exit code: $LASTEXITCODE"
+                if ($LASTEXITCODE -eq 0) {
+                    $instance = (ConvertFrom-Json -InputObject $output.ToString()) |
+                        Select-Object -First 1
+                }
+            }
+
+            return $instance
+        }
+    } catch {
+        Write-Host ($_ | Out-String)
+    }
+}

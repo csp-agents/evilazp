@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\Common.props" />
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+    <AssetTargetFallback></AssetTargetFallback>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Agent.Sdk\Agent.Sdk.csproj" />
+    <PackageReference Include="Microsoft.Azure.Relay" Version="3.1.1" />
+  </ItemGroup>
+
+</Project>

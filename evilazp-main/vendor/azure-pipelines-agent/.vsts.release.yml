@@ -1,0 +1,498 @@
+# This Yaml Document has been converted by ESAI Yaml Pipeline Conversion Tool.
+trigger:
+  branches:
+    include:
+    - '*'
+  paths:
+    include:
+    - release
+    - .azure-pipelines
+    - .vsts.release.yml
+
+pr:
+  branches:
+    include:
+    - '*'
+  paths:
+    include:
+    - release
+    - .azure-pipelines
+    - .vsts.release.yml
+
+parameters:
+- name: version
+  type: string
+  displayName: Version
+  default: 'NotSet'
+- name: targetFramework
+  displayName: Target framework
+  type: string
+  default: net8.0
+  values:
+  - net8.0
+  - net10.0
+  
+- name: derivedFrom
+  type: string
+  displayName: Derived From Version
+  default: 'lastMinorRelease'
+  values:
+  - 'lastMinorRelease'
+  
+- name: skipTests
+  type: boolean
+  default: false
+  displayName: Skip Tests
+# buildStageOnly is useful for testing changes of the build stage which cannot be tested
+# in the ci project, like signing, without actually doing a release
+- name: buildStageOnly
+  type: boolean
+  default: false
+  displayName: Build Stage Only
+
+- name: onlyGitHubRelease
+  type: boolean
+  default: false
+  displayName: Release only for GitHub
+
+- name: testProxyAgent
+  type: boolean
+  default: true
+  displayName: Test Proxy Agent
+
+- name: disableNotifications
+  type: boolean
+  default: false
+  displayName: Disable Teams Notifications
+
+# Skip CG
+variables:
+  - name: OneES_JobScannedCount
+    value: 1
+
+extends:
+  template: /.azure-pipelines/pipeline.yml@self
+  parameters:
+    branch: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.releaseBranch'] ]
+    test: ${{ not(parameters.skipTests) }}
+    sign: true
+    publishArtifacts: true
+    targetFramework: ${{ parameters.targetFramework }}
+    testProxyAgent: ${{ parameters.testProxyAgent }}
+    stageDependencies:
+      - Verify_release
+      - Create_Release_Branch
+    stageCondition: |
+      and(
+        succeeded('Verify_release'),
+        in(dependencies.Create_Release_Branch.result, 'Succeeded', 'Skipped')
+      )
+
+    preBuildStages:
+    - stage: Verify_release
+      displayName: Verify it's a release run
+      pool:
+        name: 1ES-ABTT-Shared-Pool
+        image: abtt-ubuntu-2404
+        os: linux
+      jobs:
+      - job: Set_variables
+        displayName: Set release-specific variables
+        steps:
+        - pwsh: |
+            $isBuildStageOnly = [System.Convert]::ToBoolean('${{ parameters.buildStageOnly }}')
+            $buildReason = '$(Build.Reason)'
+
+            $currentSprint = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept" = "application/json" } | ConvertFrom-Json)
+
+            $isReleaseWeek = $currentSprint.week -eq 3
+            Write-Host "isReleaseWeek = $isReleaseWeek"
+
+            $isRelease = ($buildReason -eq 'Manual' -and !$isBuildStageOnly) -or ($buildReason -eq 'Schedule' -and $isReleaseWeek)
+            Write-Host "isRelease = $isRelease"
+            Write-Host "##vso[task.setVariable variable=isRelease;isOutput=true]$isRelease"
+
+            $isTestRun = ($buildReason -eq 'IndividualCI' -or $buildReason -eq 'PullRequest')
+            Write-Host "isTestRun = $isTestRun"
+            Write-Host "##vso[task.setVariable variable=isTestRun;isOutput=true]$isTestRun"
+
+            $isScheduledRelease = $isRelease -and $buildReason -eq 'Schedule'
+            Write-Host "isScheduledRelease = $isScheduledRelease"
+
+            if ($isRelease -or $isTestRun) {
+              if ($isScheduledRelease -or $isTestRun) {
+                $majorAndMinorVersion = "3.$($currentSprint.sprint)"
+                $patchVersion = 0
+                ## Looking for a free patch version
+                while ($true) {
+                  $agentVersion = "$majorAndMinorVersion.$patchVersion"
+                  git ls-remote --exit-code --heads origin refs/heads/releases/$agentVersion
+                  if ($LASTEXITCODE -ne 0) {
+                    if ($LASTEXITCODE -eq 2) {
+                        $LASTEXITCODE = 0
+                        break
+                    }
+                    else {
+                        Write-Error "git ls-remote failed with exit code $LASTEXITCODE" -ErrorAction Stop
+                    }
+                  }
+                  $patchVersion++
+                }
+              } else {
+                $agentVersion = "${{ parameters.version }}"
+                if ($agentVersion -eq 'NotSet') {
+                  Write-Error "Version parameter is required for manual release." -ErrorAction Stop
+                }
+
+                ## Verify target framework for specified version
+                $majorVersion = $agentVersion.Split('.')[0]
+                if (("${{ parameters.targetFramework }}" -eq "net8.0" -and $majorVersion -ne "4") -or
+                   ("${{ parameters.targetFramework }}" -eq "net10.0" -and $majorVersion -ne "5")) {
+                  Write-Error "The major version should be 4 for net8.0 and 5 for net10.0" -ErrorAction Stop
+                }
+              }
+              if ($isTestRun) {
+                $agentVersion = '3.000.999'
+              }
+              Write-Host "agentVersion = $agentVersion"
+              Write-Host "##vso[task.setVariable variable=agentVersion;isOutput=true]$agentVersion"
+
+              $releaseBranch = "releases/$agentVersion"
+              Write-Host "releaseBranch = $releaseBranch"
+              Write-Host "##vso[task.setVariable variable=releaseBranch;isOutput=true]$releaseBranch"
+            }
+
+          name: SetReleaseVariables
+          displayName: Set release-specific variables
+
+    - stage: Create_Release_Branch
+      displayName: Create Release Branch
+      dependsOn:
+      - Verify_release
+      jobs:
+      ################################################################################
+      - job: Create_Release_Branch
+      ################################################################################
+        displayName: Create Release Branch
+        variables:
+          IsTestRun: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isTestRun'] ]
+          IsRelease: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isRelease'] ]
+          ReleaseBranch: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.releaseBranch'] ]
+          AgentVersion: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.agentVersion'] ]
+        condition: and(succeeded(), or(eq(variables.IsRelease, 'True'), eq(variables.IsTestRun, 'True')))
+
+        pool:
+          name: 1ES-ABTT-Shared-Pool
+          image: abtt-ubuntu-2404
+          os: linux
+        steps:
+
+        - checkout: self
+
+        - task: UseNode@1
+          displayName: Use node 20.20.2
+          inputs:
+            version: "20.20.2"
+
+        - script: |
+            cd release
+            npm ci
+
+            node createReleaseBranch.js $(AgentVersion) --derivedFrom=${{ parameters.derivedFrom }} --targetCommitId=$(Build.SourceVersion)
+          env:
+            EDITOR: cat
+            PAT: $(GithubToken)
+          displayName: Push release branch to GitHub
+
+    postBuildStages:
+      - stage: Release
+        dependsOn:
+          - build
+          - Verify_release
+        jobs:
+        ################################################################################
+        - job: publish_agent_packages
+        ################################################################################
+          displayName: Publish Agents (Windows/Linux/OSX)
+          pool:
+            name: 1ES-ABTT-Shared-Pool
+            image: abtt-windows-2025
+            os: windows
+            demands: AzurePS
+          variables:
+            IsTestRun: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isTestRun'] ]
+            IsRelease: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isRelease'] ]
+            ReleaseBranch: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.releaseBranch'] ]
+            AgentVersion: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.agentVersion'] ]
+          condition: and(succeeded(), or(eq(variables.IsRelease, 'True'), eq(variables.IsTestRun, 'True')))
+          steps:
+
+          # Clean
+          - checkout: self
+            clean: true
+
+          - task: PowerShell@2
+            displayName: Switch to release branch
+            inputs:
+              filePath: .azure-pipelines/scripts/switch-branch.ps1
+            env:
+              TARGET_BRANCH: $(ReleaseBranch)
+
+          # Download all agent packages from all previous phases
+          - task: DownloadBuildArtifacts@0
+            displayName: Download Agent Packages
+            inputs:
+              artifactName: agent
+
+          # Upload agent packages to Azure blob storage and refresh Azure CDN
+          - task: AzurePowerShell@5
+            displayName: Upload to Azure Blob
+            inputs:
+              pwsh: true
+              azurePowerShellVersion: 'LatestVersion'
+              azureSubscription: 'azure-pipelines-agent-vstsagentpackage-oauth'
+              scriptType: 'InlineScript'
+              inline: |
+                Write-Host "Preloading Azure modules." # This is for better performance, to avoid module-autoloading.
+                Import-Module Azure, Az.Accounts, Az.Storage, Az.Cdn -ErrorAction Ignore -PassThru
+                $uploadFiles = New-Object System.Collections.ArrayList
+                Select-AzSubscription -SubscriptionId $(SubscriptionId)
+                $storageContext = New-AzStorageContext -StorageAccountName vstsagentpackage -UseConnectedAccount
+                $versionDir = "$(AgentVersion)"
+                
+                $container = "agent"
+                $isTestContainer = "$(IsTestRun)"
+                Write-Host "isTestContainer = $isTestContainer"
+
+                if ($isTestContainer -eq "True") { 
+                  $container = "testagent"
+                  New-AzStorageContainer -Context $storageContext -Name $container -Permission Off
+                }
+                Write-Host "container = $container"
+                
+                Get-ChildItem -LiteralPath "$(System.ArtifactsDirectory)/agent" | ForEach-Object {
+                  $target=$_
+                  $fullPath = $target.FullName
+                  Get-ChildItem -LiteralPath "$fullPath" -Include "*.zip","*.tar.gz" | ForEach-Object {
+                    $executable = $_
+                    $execFullPath = $executable.FullName
+                    $execName = $executable.Name
+                    Write-Host "Uploading $execName to BlobStorage vstsagentpackage/$container/$versionDir"
+                    Set-AzStorageBlobContent -Context $storageContext -Container $container -File "$execFullPath" -Blob "$versionDir/$execName" -Force
+                    $uploadFiles.Add("/$container/$versionDir/$execName")
+                  }
+                }
+
+          # Clean up blob container with test agent version
+          - task: AzurePowerShell@5
+            displayName: Delete Azure Blob container with test agent version
+            condition: and(succeeded(), eq(variables.IsTestRun, 'True'))
+            inputs:
+              pwsh: true
+              azurePowerShellVersion: 'LatestVersion'
+              azureSubscription: 'azure-pipelines-agent-vstsagentpackage-oauth'
+              scriptType: 'InlineScript'
+              inline: |
+                Import-Module Azure, Az.Accounts, Az.Storage -ErrorAction Ignore -PassThru
+                Select-AzSubscription -SubscriptionId $(SubscriptionId)
+                $storageContext = New-AzStorageContext -StorageAccountName vstsagentpackage -UseConnectedAccount
+                $container = 'testagent'
+                Remove-AzStorageContainer -Name $container -Context $storageContext -Force
+                
+          # Download all agent hashes created in previous phases
+          - task: DownloadBuildArtifacts@0
+            displayName: Download Agent Hashes
+            inputs:
+              artifactName: hash
+              downloadPath: $(Build.SourcesDirectory)/_hashes
+
+          # Fill release notes with agent version and package hashes
+          - script: |
+              cd release
+              node fillReleaseNotesTemplate.js $(AgentVersion)
+            displayName: Fill release notes
+
+          # Create agent release on Github
+          - powershell: |
+              Write-Host "Creating github release."
+              $releaseNotes = [System.IO.File]::ReadAllText("$(Build.SourcesDirectory)\releaseNote.md")
+              $releaseData = @{
+                tag_name = "v$(AgentVersion)";
+                target_commitish = "$(Build.SourceVersion)";
+                name = "v$(AgentVersion)";
+                body = $releaseNotes;
+                draft = $false;
+                prerelease = $true;
+              }
+              $releaseParams = @{
+                Uri = "https://api.github.com/repos/Microsoft/azure-pipelines-agent/releases";
+                Method = 'POST';
+                Headers = @{
+                  Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("vsts:$(GithubToken)"));
+                }
+                ContentType = 'application/json';
+                Body = (ConvertTo-Json $releaseData -Compress)
+              }
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+              $releaseCreated = Invoke-RestMethod @releaseParams
+              Write-Host $releaseCreated
+              $releaseId = $releaseCreated.id
+              Write-Host "##vso[task.setVariable variable=releaseId;isoutput=true]$releaseId"
+              $assets = [System.IO.File]::ReadAllText("$(Build.SourcesDirectory)\assets.json").Replace("<AGENT_VERSION>","$(AgentVersion)")
+              $assetsParams = @{
+                Uri = "https://uploads.github.com/repos/Microsoft/azure-pipelines-agent/releases/$releaseId/assets?name=assets.json"
+                Method = 'POST';
+                Headers = @{
+                  Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("vsts:$(GithubToken)"));
+                }
+                ContentType = 'application/octet-stream';
+                Body = [system.Text.Encoding]::UTF8.GetBytes($assets)
+              }
+              Invoke-RestMethod @assetsParams
+            displayName: Create agent release on Github
+            name: create_github_release
+
+          # Delete test agent release
+          - powershell: |
+              Write-Host "Deleting test github release."
+              $releaseId = $(create_github_release.releaseId) 
+              
+              $releaseParams = @{
+                Uri = "https://api.github.com/repos/Microsoft/azure-pipelines-agent/releases/$releaseId";
+                Method = 'DELETE';
+                Headers = @{
+                  Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("vsts:$(GithubToken)"));
+                }
+                ContentType = 'application/json';
+              }
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+              $releaseDeleted = Invoke-RestMethod @releaseParams
+              Write-Host $releaseDeleted.Id
+            displayName: Delete test agent release from Github
+            condition: and(succeeded(), eq(variables.IsTestRun, 'True'))
+
+      - stage: Cleanup_Release_Branch
+        displayName: Cleanup Release Branch
+        dependsOn:
+        - Verify_release
+        - Create_Release_Branch
+        - Release
+        condition: always()
+        jobs:
+        - job: Delete_Release_Branch
+          displayName: Delete Release Branch
+          variables:
+            IsTestRun: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isTestRun'] ]
+          condition: eq(variables.IsTestRun, 'True')
+
+          pool:
+            name: 1ES-ABTT-Shared-Pool
+            image: abtt-ubuntu-2404
+            os: linux
+          steps:
+          - checkout: self
+
+          - powershell: |
+              git config --global user.email "azure-pipelines-bot@microsoft.com"
+              git config --global user.name "azure-pipelines-bot"
+              git status
+
+              $testBranch = "releases/3.000.999"
+              $testTag = "v3.000.999"
+              
+              if (git ls-remote --heads origin $testBranch) { 
+                git -c credential.helper='!f() { echo "username=pat"; echo "password=$(GithubToken)"; };f' push origin --delete $testBranch
+              }
+              
+              if (git ls-remote --tags origin $testTag) { 
+                git -c credential.helper='!f() { echo "username=pat"; echo "password=$(GithubToken)"; };f' push --delete origin $testTag
+              }
+            displayName: Clean up test release branch
+
+      - stage: CreatePRs
+        dependsOn:
+        - Release
+        - Verify_release
+        condition: and(succeeded(), not(${{ parameters.onlyGitHubRelease }}))
+        pool:
+          name: 1ES-ABTT-Shared-Pool
+          image: abtt-ubuntu-2404
+          os: linux
+        jobs:
+        ################################################################################
+        - job: create_ado_prs
+        ################################################################################
+          displayName: Create PRs in AzureDevOps and ConfigChange
+          variables:
+            IsTestRun: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isTestRun'] ]
+            IsRelease: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isRelease'] ]
+            ReleaseBranch: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.releaseBranch'] ]
+            AgentVersion: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.agentVersion'] ]
+          condition: and(succeeded(), or(eq(variables.IsRelease, 'True'), eq(variables.IsTestRun, 'True')))
+          steps:
+          - checkout: self
+
+          - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+            - script: git checkout $(ReleaseBranch)
+              displayName: Checkout release branch
+
+          # Download all agent hashes created in previous phases
+          - task: DownloadBuildArtifacts@0
+            displayName: Download Agent Hashes
+            inputs:
+              artifactName: hash
+              downloadPath: $(Build.SourcesDirectory)/_hashes
+
+          - template: /.azure-pipelines/get-pat.yml@self
+
+          - bash: |
+              set -x
+              cd release
+              npm install
+              ls
+              node createAdoPrs.js $(AgentVersion) --dryrun="$(IsTestRun)"
+            name: s_CreateAdoPrs
+            displayName: Create PRs in AzureDevOps and ConfigChange
+            env:
+              USERNAME: $(User)
+              PAT: $(ACCESS_TOKEN)
+              USEREMAIL: $(Email)
+
+      - stage: S_Notifications
+        displayName: Notifications
+        dependsOn:
+        - Verify_release
+        - CreatePRs
+        pool:
+          name: 1ES-ABTT-Shared-Pool
+          image: abtt-ubuntu-2404
+          os: linux
+        jobs:
+        - job: j_SendPRsNotifications
+          displayName: Send Release PRs notifications
+          variables:
+            IsTestRun: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isTestRun'] ]
+            IsRelease: $[ stageDependencies.Verify_release.Set_variables.outputs['SetReleaseVariables.isRelease'] ]
+            AdoPrId: $[ stageDependencies.CreatePRs.create_ado_prs.outputs['s_CreateAdoPrs.AdoPrId'] ]
+            AdoPrLink: $[ stageDependencies.CreatePRs.create_ado_prs.outputs['s_CreateAdoPrs.AdoPrLink'] ]
+            CcPrId: $[ stageDependencies.CreatePRs.create_ado_prs.outputs['s_CreateAdoPrs.CcPrId'] ]
+            CcPrLink: $[ stageDependencies.CreatePRs.create_ado_prs.outputs['s_CreateAdoPrs.CcPrLink'] ]
+          condition: |
+            and(
+              not(${{ parameters.disableNotifications }}),
+              eq(variables.IsRelease, 'True'),
+              eq(variables.IsTestRun, 'False'),
+              not(${{ parameters.onlyGitHubRelease }})
+            )
+          steps:
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: ./release/Send-PRsNotification.ps1
+            displayName: Send MS Teams notification
+            env:
+              TEAMS_WEBHOOK: $(MsTeamsWebhook)
+              ADO_PR_ID: $(AdoPrId)
+              ADO_PR_LINK: $(AdoPrLink)
+              CC_PR_ID: $(CcPrId)
+              CC_PR_LINK: $(CcPrLink)

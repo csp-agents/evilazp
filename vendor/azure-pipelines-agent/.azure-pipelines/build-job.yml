@@ -1,0 +1,303 @@
+# This Yaml Document has been converted by ESAI Yaml Pipeline Conversion Tool.
+parameters:
+
+- name: jobName
+  type: string
+
+- name: displayName
+  type: string
+
+- name: pool
+  type: object
+
+- name: container
+  type: string
+
+- name: targetFramework
+  type: string
+
+- name: timeoutInMinutes
+  type: number
+
+- name: branch
+  type: string
+
+- name: os
+  type: string
+  values:
+  - win
+  - linux
+  - linux-musl
+  - osx
+
+- name: arch
+  type: string
+  values:
+  - arm
+  - arm64
+  - x64
+  - x86
+
+- name: unitTests
+  type: boolean
+
+- name: functionalTests
+  type: boolean
+
+- name: codeCoverage
+  type: boolean
+
+- name: sign
+  type: boolean
+
+- name: verifySigning
+  type: boolean
+
+- name: publishArtifact
+  type: boolean
+
+- name: enableADOLogIssue
+  type: boolean
+  default: false
+
+- name: packageType
+  type: string
+  default: agent
+  values:
+  - agent
+  - pipelines-agent
+
+- name: disableSdl
+  type: boolean
+  default: false
+
+- name: justificationForDisablingSdl
+  type: string
+  default: ''
+
+jobs:
+
+- job: ${{ parameters.jobName }}
+  displayName: ${{ parameters.displayName }}
+  pool: ${{ parameters.pool }}
+  timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+  ${{ if eq(parameters.targetFramework, 'all') }}:
+    strategy:
+      matrix:
+        NET8.0:
+          targetFramework: 'net8.0'
+        NET10.0:
+          targetFramework: 'net10.0'
+
+
+  ${{ if ne(parameters.container, '') }}:
+    container: ${{ parameters.container }}
+
+  ${{ if eq(parameters.disableSdl, true) }}:
+    parameters:
+      sdl:
+        codeql:
+          compiled:
+            enabled: false
+            justificationForDisabling: ${{ parameters.justificationForDisablingSdl}}
+        # Guardian / BinSkim ship as x64 binaries today and cannot run on
+        # Linux ARM64 hosts ("cannot execute binary file: Exec format error").
+        # When SDL is being disabled for a build (e.g. Alpine/Linux ARM64),
+        # also turn off these compiled scanners and the PostAnalysis gate so
+        # the pipeline does not fail with Guardian exit code 126.
+        ${{ if and(eq(parameters.arch, 'arm64'), ne(parameters.os, 'win'), ne(parameters.os, 'osx')) }}:
+          binskim:
+            enabled: false
+          policheck:
+            enabled: false
+          credscan:
+            enabled: false
+          psscriptanalyzer:
+            enabled: false
+          armory:
+            enabled: false
+          tsa:
+            enabled: false
+  variables:
+    PACKAGE_TYPE: ${{ parameters.packageType }}
+    ${{ if eq(parameters.os, 'win') }}:
+      devCommand: dev.cmd
+    ${{ if ne(parameters.os, 'win') }}:
+      devCommand: ./dev.sh
+    layoutRoot: '_layout/${{ parameters.os }}-${{ parameters.arch }}'
+    DisableCFSDetector: true
+    DisableDockerDetector: true
+    nugetMultiFeedWarnLevel: none
+    # Clear GDN_FILEPATH on ARM64 Linux to prevent Guardian from using the pre-installed x64 binary
+    ${{ if and(eq(parameters.arch, 'arm64'), ne(parameters.os, 'win'), ne(parameters.os, 'osx')) }}:
+      GDN_FILEPATH: ''
+    CheckoutBranch: ${{ parameters.branch }}
+    ${{ if ne(parameters.targetFramework, 'all') }}:
+      targetFramework: ${{ parameters.targetFramework }}
+  templateContext:
+    outputs:
+    - ${{ if or(parameters.unitTests, parameters.functionalTests) }}:
+      - output: buildArtifacts
+        displayName: 'Publish Test logs'
+        condition: always()
+        PathtoPublish: src/Test/TestLogs
+        ArtifactName: ${{ parameters.os }}-${{ parameters.arch }}-$(System.JobId)
+    - ${{ if eq(parameters.publishArtifact, true) }}:
+      - output: buildArtifacts
+        displayName: 'Publish Hash Artifact'
+        PathtoPublish: _package
+        ArtifactName: agent
+    - ${{ if eq(parameters.publishArtifact, true) }}:
+      - output: buildArtifacts
+        displayName: 'Publish Agent Artifact'
+        PathtoPublish: _package_hash
+        ArtifactName: hash
+  steps:
+
+  - checkout: self
+    clean: true
+
+  - task: Bash@3
+    displayName: Switch to target branch
+    inputs:
+      filePath: .azure-pipelines/scripts/switch-branch.sh
+    env:
+      TARGET_BRANCH: $(CheckoutBranch)
+    condition: |
+      and(
+        eq(variables['Build.SourceBranch'], 'refs/heads/master'),
+        ne(variables.CheckoutBranch, '')
+      )
+
+  # 1ES images used on the ARM pool doesn't contain unzip tool, so we need to install it before starting the build
+  - ${{ if and(eq(parameters.arch, 'arm64'), ne(parameters.os, 'osx'), ne(parameters.os, 'win')) }}:
+    - script: sudo dnf -y update && sudo dnf -y install unzip
+      displayName: Install unzip
+      retryCountOnTaskFailure: 5
+
+  # Install nuget
+  - ${{ if eq(parameters.os, 'win') }}:
+    - task: NuGetToolInstaller@1
+      displayName: Install NuGet for signing tests
+
+  # Set up auth for nuget for when new packages need to be consumed
+  - task: NuGetAuthenticate@1
+
+  # Build agent layout
+  - script: ${{ variables.devCommand }} layout $(targetFramework) Release ${{ parameters.os }}-${{ parameters.arch }}
+    workingDirectory: src
+    displayName: Build & Layout Release
+    retryCountOnTaskFailure: 5
+    ${{ if parameters.enableADOLogIssue }}:
+      env:
+        ADO_ENABLE_LOGISSUE: true
+
+  # Check if broken symlinks exist in the agent build
+  - task: Bash@3
+    inputs:
+      filePath: src/Misc/check-symlinks.sh
+    displayName: Check symlinks
+
+  # Run l0 tests
+  - ${{ if parameters.unitTests }}:
+    - ${{ if and(eq(parameters.os, 'win'), eq(parameters.arch, 'x86')) }}:
+      - task: UseDotNet@2
+        displayName: Install .NET Core 6 Runtime
+        inputs:
+          version: '6.0.x'
+          packageType: 'runtime'
+          installationPath: 'C:\Program Files (x86)\dotnet'
+        env:
+          PROCESSOR_ARCHITECTURE: x86
+    - script: ${{ variables.devCommand }} testl0 $(targetFramework) Debug ${{ parameters.os }}-${{ parameters.arch }}
+      workingDirectory: src
+      displayName: Unit tests
+      timeoutInMinutes: 5
+
+  # Run l1 tests
+  - ${{ if parameters.functionalTests }}:
+    - ${{ if and(eq(parameters.os, 'win'), eq(parameters.arch, 'x86')) }}:
+      - task: UseDotNet@2
+        displayName: Install .NET Core 6 SDK
+        inputs:
+          version: '6.0.424'
+          packageType: sdk
+          performMultiLevelLookup: true
+    - script: ${{ variables.devCommand }} testl1 $(targetFramework) Debug ${{ parameters.os }}-${{ parameters.arch }}
+      workingDirectory: src
+      displayName: Functional tests
+
+  - ${{ if or(parameters.unitTests, parameters.functionalTests) }}:
+    # Publish test results
+    - task: PublishTestResults@2
+      displayName: Publish Test Results **/*.trx
+      inputs:
+        testRunner: VSTest
+        testResultsFiles: '**/*.trx'
+        testRunTitle: 'Agent Tests - ${{ parameters.os }}-${{ parameters.arch }}'
+      condition: always()
+
+  # Code coverage
+  - ${{ if and(parameters.codeCoverage, parameters.unitTests, parameters.functionalTests) }}:
+    - script: |
+        dotnet tool install --global dotnet-reportgenerator-globaltool --configfile $(Build.SourcesDirectory)/src/NuGet.Config
+        dotnet tool install --global dotnet-coverage --configfile $(Build.SourcesDirectory)/src/NuGet.Config
+      displayName: Install Code Coverage and Report Generator
+
+    - script: "${{ variables.devCommand }} report $(targetFramework) Debug ${{ parameters.os }}-${{ parameters.arch }}"
+      displayName: Generate Code Coverage report
+      workingDirectory: src
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'cobertura'
+        summaryFileLocation: _reports/**/Cobertura.xml
+        pathToSources: src
+
+  - ${{ if eq(parameters.os, 'osx') }}:
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '6.0.x'
+
+  - ${{ if parameters.sign }}:
+    # Signing steps
+    - template: /.azure-pipelines/signing.yml@self
+      parameters:
+        layoutRoot: ${{ variables.layoutRoot }}
+        isWindows: ${{ eq(parameters.os, 'win') }}
+
+  # Publish artifacts
+  - ${{ if parameters.publishArtifact }}:
+
+    # Package .NET Core Windows dependency (VC++ Redistributable)
+    - ${{ if eq(parameters.os, 'win') }}:
+      - template: /.azure-pipelines/package-vcredist.yml@self
+        parameters:
+          layoutRoot: ${{ variables.layoutRoot }}
+          flavor: ${{ parameters.arch }}
+
+    # Create agent package zip
+    - script: "${{ variables.devCommand }} package $(targetFramework) Release ${{ parameters.os }}-${{ parameters.arch }}"
+      workingDirectory: src
+      displayName: Package Release
+
+    - script: "${{ variables.devCommand }} hash $(targetFramework) Release ${{ parameters.os }}-${{ parameters.arch }}"
+      workingDirectory: src
+      displayName: Hash Package
+
+  - ${{ if parameters.verifySigning }}:
+
+    # Verify all binaries are signed (generate report)
+    - task: securedevelopmentteam.vss-secure-development-tools.build-task-codesignvalidation.CodesignValidation@0
+      displayName: 'Generate Codesign Report'
+      inputs:
+        path: ${{ variables.layoutRoot }}
+
+    # Verify all binaries are signed (check report)
+    - task: securedevelopmentteam.vss-secure-development-tools.build-task-postanalysis.PostAnalysis@2
+      displayName: 'Verify Codesign Report'
+      inputs:
+        CodesignValidation: true
+        CodesignValidationBreakOn: WarningAbove
+        ToolLogsNotFoundAction: Error
